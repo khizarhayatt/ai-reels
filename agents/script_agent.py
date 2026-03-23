@@ -1,6 +1,6 @@
-"""Claude-powered script generation agent.
+"""OpenAI GPT-powered script generation agent.
 
-Calls the Anthropic API and returns a fully-populated VideoPlan.
+Calls the OpenAI Chat Completions API and returns a fully-populated VideoPlan.
 """
 
 from __future__ import annotations
@@ -10,10 +10,10 @@ import re
 import time
 from datetime import datetime, timezone
 
-import anthropic
+import openai
 
 from config import PLATFORM_CONFIGS, Settings
-from models.video_plan import VideoPlan, VoiceoverInstructions, YouTubeMetadata, Scene
+from models.video_plan import Scene, VideoPlan, VoiceoverInstructions, YouTubeMetadata
 
 
 # ── Prompt templates ──────────────────────────────────────────────────────────
@@ -88,7 +88,7 @@ def generate_video_plan(
     language: str,
     settings: Settings,
 ) -> VideoPlan:
-    """Generate a full VideoPlan using Claude AI.
+    """Generate a full VideoPlan using OpenAI GPT.
 
     Raises:
         ScriptGenerationError: on API failure or unrecoverable JSON parse error.
@@ -101,10 +101,10 @@ def generate_video_plan(
     system = _build_system_prompt(platform, duration, num_scenes)
     user = _build_user_prompt(topic, platform, tone, duration, language, num_scenes, platform_cfg)
 
-    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
-    raw_json = _call_claude_with_retry(client, system, user, settings)
+    client = openai.OpenAI(api_key=settings.openai_api_key)
+    raw_json = _call_openai_with_retry(client, system, user, settings)
 
-    plan = _parse_claude_response(raw_json, topic, platform, tone, duration, language)
+    plan = _parse_response(raw_json, topic, platform, tone, duration, language)
     plan.created_at = datetime.now(timezone.utc).isoformat()
     return plan
 
@@ -112,7 +112,7 @@ def generate_video_plan(
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _calculate_num_scenes(platform: str, duration: int) -> int:
-    """~5-8 seconds per scene for short-form; ~30-60 seconds per scene for YouTube."""
+    """~5-8 seconds per scene for short-form; ~45 seconds per scene for YouTube."""
     if platform == "youtube":
         scenes = max(3, duration // 45)
     else:
@@ -149,8 +149,8 @@ def _build_user_prompt(
     )
 
 
-def _call_claude_with_retry(
-    client: anthropic.Anthropic,
+def _call_openai_with_retry(
+    client: openai.OpenAI,
     system: str,
     user: str,
     settings: Settings,
@@ -158,26 +158,31 @@ def _call_claude_with_retry(
 ) -> str:
     delay = 2
     last_error: Exception = RuntimeError("Unknown error")
+
     for attempt in range(max_retries):
         try:
-            response = client.messages.create(
-                model=settings.claude_model,
-                max_tokens=settings.claude_max_tokens,
-                system=system,
-                messages=[{"role": "user", "content": user}],
+            response = client.chat.completions.create(
+                model=settings.openai_model,
+                max_tokens=settings.openai_max_tokens,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": user},
+                ],
             )
-            return response.content[0].text
-        except anthropic.RateLimitError as exc:
+            return response.choices[0].message.content or ""
+        except openai.RateLimitError as exc:
             last_error = exc
             if attempt < max_retries - 1:
                 time.sleep(delay)
                 delay *= 2
-        except anthropic.APIError as exc:
-            raise ScriptGenerationError(f"Claude API error: {exc}") from exc
+        except openai.APIError as exc:
+            raise ScriptGenerationError(f"OpenAI API error: {exc}") from exc
+
     raise ScriptGenerationError(f"Rate limit exceeded after {max_retries} retries: {last_error}")
 
 
-def _parse_claude_response(
+def _parse_response(
     raw: str,
     topic: str,
     platform: str,
@@ -185,15 +190,16 @@ def _parse_claude_response(
     duration: int,
     language: str,
 ) -> VideoPlan:
-    # Strip accidental markdown code fences
+    # Strip accidental markdown code fences (safety net, response_format should prevent this)
     cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.MULTILINE)
-    cleaned = re.sub(r"\s*```$", "", cleaned.strip(), flags=re.MULTILINE)
-    cleaned = cleaned.strip()
+    cleaned = re.sub(r"\s*```$", "", cleaned.strip(), flags=re.MULTILINE).strip()
 
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError as exc:
-        raise ScriptGenerationError(f"Claude returned invalid JSON: {exc}\n\nRaw output:\n{raw[:500]}") from exc
+        raise ScriptGenerationError(
+            f"GPT returned invalid JSON: {exc}\n\nRaw output:\n{raw[:500]}"
+        ) from exc
 
     # Inject input fields
     data["topic"] = topic
@@ -202,15 +208,11 @@ def _parse_claude_response(
     data["duration_seconds"] = duration
     data["language"] = language
 
-    # Coerce voiceover_instructions to model if it's a dict
+    # Coerce nested dicts → Pydantic models
     if isinstance(data.get("voiceover_instructions"), dict):
         data["voiceover_instructions"] = VoiceoverInstructions(**data["voiceover_instructions"])
-
-    # Coerce youtube_metadata
     if isinstance(data.get("youtube_metadata"), dict):
         data["youtube_metadata"] = YouTubeMetadata(**data["youtube_metadata"])
-
-    # Coerce scenes
     if isinstance(data.get("scenes"), list):
         data["scenes"] = [Scene(**s) if isinstance(s, dict) else s for s in data["scenes"]]
 
@@ -219,7 +221,7 @@ def _parse_claude_response(
     except Exception as exc:
         raise ScriptGenerationError(f"VideoPlan validation failed: {exc}") from exc
 
-    # Warn if scene durations are way off
+    # Warn if total duration drifts > 20%
     total = sum(s.duration_seconds for s in plan.scenes)
     if abs(total - duration) > duration * 0.20:
         import warnings
